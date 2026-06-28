@@ -1,156 +1,174 @@
+using System.Collections;
 using UnityEngine;
 using Unity.Netcode;
-using UnityEngine.InputSystem; // Added for the new Input System API
+using UnityEngine.InputSystem;
 
-/// <summary>
-/// Handles the shared control of a single body between Player 1 (Host/Server) 
-/// and Player 2 (Client) using Unity's new Input System.
-/// </summary>
 public class SharedBodyController : NetworkBehaviour
 {
-    [Header("Movement Settings")]
+    public enum PlayerRole { Unassigned, Player1_Waist, Player2_Legs }
+    
+    [Header("Network Role")]
+    public PlayerRole localRole = PlayerRole.Unassigned;
+
+    [Header("Waist Movement Settings")]
+    [SerializeField] private float moveSpeed = 3f;
     [SerializeField] private float rotationSpeed = 90f;
-    [SerializeField] private float leanSpeed = 30f;
-    [SerializeField] private float maxLeanAngle = 45f;
 
-    [Header("Visual Placeholders")]
-    [SerializeField] private Transform leftLegVisual;
-    [SerializeField] private Transform rightLegVisual;
+    [Header("IK Foot Targets")]
+    [SerializeField] private Transform leftFootTarget;
+    [SerializeField] private Transform rightFootTarget;
 
-    // NetworkVariables sync data from Server down to all Clients automatically
-    private NetworkVariable<float> netCurrentLean = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
-    private NetworkVariable<bool> netLeftLegRaised = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
-    private NetworkVariable<bool> netRightLegRaised = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    [Header("Manual Step Settings")]
+    [SerializeField] private float liftHeight = 0.5f;
+    [SerializeField] private float dropSpeed = 10f;
+    [SerializeField] private LayerMask groundLayer;
 
-    private float currentLeanAngle = 0f;
+    private float leftDefaultY;
+    private float rightDefaultY;
+
+    // Sync variables using Server-authoritative writes
+    private NetworkVariable<bool> netLeftLegLifted = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<bool> netRightLegLifted = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    
+    // Inputs must be synced from Player 1 Client to Server via RPC
+    private NetworkVariable<float> netMoveInput = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<float> netTurnInput = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
     public override void OnNetworkSpawn()
     {
         base.OnNetworkSpawn();
-        Debug.Log($"Body Spawned. Role: {(IsServer ? "Player 1 (Host)" : "Player 2 (Client)")}");
+        
+        leftDefaultY = leftFootTarget.localPosition.y; // Local coordinates are safer if body moves
+        rightDefaultY = rightFootTarget.localPosition.y;
+    }
+
+    public void InitializeLocalPlayerRole()
+    {
+        ulong localClientId = NetworkManager.Singleton.LocalClientId;
+        
+        // Simple logic: Server/Host or first client is Player 1, second client is Player 2
+        var connectedClients = NetworkManager.Singleton.ConnectedClientsIds;
+        
+        if (connectedClients.Count >= 1 && connectedClients[0] == localClientId)
+        {
+            localRole = PlayerRole.Player1_Waist;
+            Debug.Log("You are Player 1: Waist and Rotation Control.");
+        }
+        else if (connectedClients.Count >= 2 && connectedClients[1] == localClientId)
+        {
+            localRole = PlayerRole.Player2_Legs;
+            Debug.Log("You are Player 2: Leg Lifter.");
+        }
     }
 
     private void Update()
     {
         if (!IsSpawned) return;
 
-        // 1. EVERYONE updates their visuals based on synced network variables
-        ApplyNetworkVisuals();
+        // 1. Gather local inputs based on assigned role and send them to server
+        HandleLocalInputs();
 
-        // 2. Only the SERVER handles Player 1's rotation logic
+        // 2. Only Server processes physical body movement using synced data
         if (IsServer)
         {
-            HandlePlayer1Rotation();
+            ProcessServerMovement();
         }
 
-        // 3. Only the CLIENT handles Player 2's input logic
-        if (IsClient && !IsServer)
-        {
-            HandlePlayer2Inputs();
-        }
+        // 3. EVERYONE updates visual components (Leg lifting) based on NetworkVariables
+        ProcessFootHeights();
     }
 
-    /// <summary>
-    /// Reads the synced NetworkVariables and updates visuals for BOTH host and client.
-    /// </summary>
-    private void ApplyNetworkVisuals()
+    private void HandleLocalInputs()
     {
-        // Apply leaning visualization on the X axis
-        transform.localRotation = Quaternion.Euler(netCurrentLean.Value, transform.localRotation.eulerAngles.y, 0f);
-
-        // Both host and client will now move their local leg cubes properly
-        if (leftLegVisual != null)
-            leftLegVisual.localPosition = new Vector3(leftLegVisual.localPosition.x, netLeftLegRaised.Value ? 0.5f : 0f, leftLegVisual.localPosition.z);
-
-        if (rightLegVisual != null)
-            rightLegVisual.localPosition = new Vector3(rightLegVisual.localPosition.x, netRightLegRaised.Value ? 0.5f : 0f, rightLegVisual.localPosition.z);
-    }
-
-    #region PLAYER 1 (SERVER / HOST) LOGIC
-    /// <summary>
-    /// Player 1 controls rotation directly on the server via A/D or Left/Right arrows.
-    /// </summary>
-    private void HandlePlayer1Rotation()
-    {
-        // Safety check to ensure a keyboard is connected
         if (Keyboard.current == null) return;
 
-        float horizontalInput = 0f;
-
-        // Read direct keyboard states instead of old Input.GetAxis
-        if (Keyboard.current.dKey.isPressed || Keyboard.current.rightArrowKey.isPressed) horizontalInput += 1f;
-        if (Keyboard.current.aKey.isPressed || Keyboard.current.leftArrowKey.isPressed) horizontalInput -= 1f;
-
-        if (Mathf.Abs(horizontalInput) > 0.01f)
+        // PLAYER 1 INPUTS (Waist)
+        if (localRole == PlayerRole.Player1_Waist)
         {
-            transform.Rotate(Vector3.up, horizontalInput * rotationSpeed * Time.deltaTime);
+            float turn = 0f;
+            if (Keyboard.current.dKey.isPressed || Keyboard.current.rightArrowKey.isPressed) turn += 1f;
+            if (Keyboard.current.aKey.isPressed || Keyboard.current.leftArrowKey.isPressed) turn -= 1f;
+
+            float move = 0f;
+            if (Keyboard.current.wKey.isPressed || Keyboard.current.upArrowKey.isPressed) move += 1f;
+            if (Keyboard.current.sKey.isPressed || Keyboard.current.downArrowKey.isPressed) move -= 1f;
+
+            SubmitWaistInputServerRpc(move, turn);
+        }
+
+        // PLAYER 2 INPUTS (Legs)
+        if (localRole == PlayerRole.Player2_Legs)
+        {
+            if (Keyboard.current.qKey.wasPressedThisFrame) SubmitLegStateServerRpc(true, true);
+            if (Keyboard.current.qKey.wasReleasedThisFrame) SubmitLegStateServerRpc(true, false);
+
+            if (Keyboard.current.eKey.wasPressedThisFrame) SubmitLegStateServerRpc(false, true);
+            if (Keyboard.current.eKey.wasReleasedThisFrame) SubmitLegStateServerRpc(false, false);
         }
     }
 
-    /// <summary>
-    /// Server reads the synced NetworkVariables and updates visuals/transforms.
-    /// </summary>
-    private void ApplyClientInputs()
+    #region SERVER PHYSICS AND MOVEMENT Processing
+    private void ProcessServerMovement()
     {
-        // Apply leaning visualization on the X axis
-        transform.localRotation = Quaternion.Euler(netCurrentLean.Value, transform.localRotation.eulerAngles.y, 0f);
+        // Apply rotation from synced network input
+        if (Mathf.Abs(netTurnInput.Value) > 0.01f)
+        {
+            transform.Rotate(Vector3.up, netTurnInput.Value * rotationSpeed * Time.deltaTime);
+        }
 
-        // Simple placeholder logic to visually lift legs up and down based on network state
-        if (leftLegVisual != null)
-            leftLegVisual.localPosition = new Vector3(leftLegVisual.localPosition.x, netLeftLegRaised.Value ? 0.5f : 0f, leftLegVisual.localPosition.z);
-
-        if (rightLegVisual != null)
-            rightLegVisual.localPosition = new Vector3(rightLegVisual.localPosition.x, netRightLegRaised.Value ? 0.5f : 0f, rightLegVisual.localPosition.z);
+        // Apply forward/back movement from synced network input
+        if (Mathf.Abs(netMoveInput.Value) > 0.01f)
+        {
+            transform.position += transform.forward * netMoveInput.Value * moveSpeed * Time.deltaTime;
+        }
     }
     #endregion
 
-    #region PLAYER 2 (CLIENT) LOGIC
-    /// <summary>
-    /// Player 2 captures input locally and passes it up to the server via RPCs.
-    /// </summary>
-    private void HandlePlayer2Inputs()
+    #region RPCS (INPUT SUBMISSIONS TO SERVER)
+    [Rpc(SendTo.Server)]
+    private void SubmitWaistInputServerRpc(float move, float turn)
     {
-        if (Keyboard.current == null) return;
-
-        // 1. Handle Leaning Input (W/S keys or Up/Down arrows)
-        float verticalInput = 0f;
-        if (Keyboard.current.wKey.isPressed || Keyboard.current.upArrowKey.isPressed) verticalInput += 1f;
-        if (Keyboard.current.sKey.isPressed || Keyboard.current.downArrowKey.isPressed) verticalInput -= 1f;
-
-        if (Mathf.Abs(verticalInput) > 0.01f)
-        {
-            currentLeanAngle += verticalInput * leanSpeed * Time.deltaTime;
-            currentLeanAngle = Mathf.Clamp(currentLeanAngle, -maxLeanAngle, maxLeanAngle);
-
-            SubmitLeanServerRpc(currentLeanAngle);
-        }
-
-        // 2. Handle Leg Controls using frame triggers (Q for Left, E for Right)
-        if (Keyboard.current.qKey.wasPressedThisFrame) SubmitLegLiftServerRpc(true, true);
-        if (Keyboard.current.qKey.wasReleasedThisFrame) SubmitLegLiftServerRpc(true, false);
-
-        if (Keyboard.current.eKey.wasPressedThisFrame) SubmitLegLiftServerRpc(false, true);
-        if (Keyboard.current.eKey.wasReleasedThisFrame) SubmitLegLiftServerRpc(false, false);
+        netMoveInput.Value = move;
+        netTurnInput.Value = turn;
     }
 
-    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
-    private void SubmitLeanServerRpc(float leanValue)
+    [Rpc(SendTo.Server)]
+    private void SubmitLegStateServerRpc(bool isLeftLeg, bool isLifted)
     {
-        netCurrentLean.Value = leanValue;
+        if (isLeftLeg) netLeftLegLifted.Value = isLifted;
+        else netRightLegLifted.Value = isLifted;
+    }
+    #endregion
+
+    #region VISUALS (EVERYONE)
+    private void ProcessFootHeights()
+    {
+        ProcessSingleFoot(leftFootTarget, netLeftLegLifted.Value, leftDefaultY);
+        ProcessSingleFoot(rightFootTarget, netRightLegLifted.Value, rightDefaultY);
     }
 
-    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
-    private void SubmitLegLiftServerRpc(bool isLeftLeg, bool isRaised)
+    private void ProcessSingleFoot(Transform footTarget, bool isLifted, float defaultY)
     {
-        if (isLeftLeg)
+        if (isLifted)
         {
-            netLeftLegRaised.Value = isRaised;
-            Debug.Log($"Server received: Left leg raised = {isRaised}");
+            float targetLiftHeight = transform.position.y + liftHeight;
+            footTarget.position = new Vector3(footTarget.position.x, targetLiftHeight, footTarget.position.z);
         }
         else
         {
-            netRightLegRaised.Value = isRaised;
-            Debug.Log($"Server received: Right leg raised = {isRaised}");
+            Vector3 rayStart = new Vector3(footTarget.position.x, transform.position.y + 2f, footTarget.position.z);
+            float targetY = transform.position.y + defaultY; // Adjusted to be relative to the body's actual current height
+
+            if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit, 5f, groundLayer))
+            {
+                targetY = hit.point.y;
+            }
+
+            if (footTarget.position.y > targetY)
+            {
+                float newY = Mathf.MoveTowards(footTarget.position.y, targetY, dropSpeed * Time.deltaTime);
+                footTarget.position = new Vector3(footTarget.position.x, newY, footTarget.position.z);
+            }
         }
     }
     #endregion
