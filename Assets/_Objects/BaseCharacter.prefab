@@ -436,6 +436,11 @@ PrefabInstance:
       insertIndex: -1
       addedObject: {fileID: 2887787853178404050}
   m_SourcePrefab: {fileID: 100100000, guid: 7966d979d9982a743a30e3b75a402b94, type: 3}
+--- !u!4 &102459199453280895 stripped
+Transform:
+  m_CorrespondingSourceObject: {fileID: 3742407835892290726, guid: 7966d979d9982a743a30e3b75a402b94, type: 3}
+  m_PrefabInstance: {fileID: 3639953036666580697}
+  m_PrefabAsset: {fileID: 0}
 --- !u!4 &1282671817528389429 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: -6679048010460921364, guid: 7966d979d9982a743a30e3b75a402b94, type: 3}
@@ -484,7 +489,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d5a57f767e5e46a458fc5d3c628d0cbb, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Unity.Netcode.Runtime::Unity.Netcode.NetworkObject
-  GlobalObjectIdHash: 1275249165
+  GlobalObjectIdHash: 1833304117
   InScenePlacedSourceGlobalObjectIdHash: 0
   DeferredDespawnTick: 0
   Ownership: 1
@@ -512,11 +517,13 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SharedBodyController
   ShowTopMostFoldoutHeaderGroup: 1
   localRole: 0
+  hipsTransform: {fileID: 102459199453280895}
   moveSpeed: 3
   rotationSpeed: 90
   leftFootTarget: {fileID: 5954962043897546528}
   rightFootTarget: {fileID: 1776905800035925650}
   liftHeight: 0.5
+  liftSpeed: 8
   dropSpeed: 10
   groundLayer:
     serializedVersion: 2

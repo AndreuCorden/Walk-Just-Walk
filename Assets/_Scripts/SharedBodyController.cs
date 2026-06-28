@@ -19,18 +19,23 @@ public class SharedBodyController : NetworkBehaviour
     [SerializeField] private Transform rightFootTarget;
 
     [Header("Manual Step Settings")]
-    [SerializeField] private float liftHeight = 0.5f;
+    [SerializeField] private float liftHeight = 0.3f; 
+    [SerializeField] private float liftSpeed = 8f;     
     [SerializeField] private float dropSpeed = 10f;
     [SerializeField] private LayerMask groundLayer;
 
     private float leftDefaultY;
     private float rightDefaultY;
 
+    // Track the exact world position where a foot was planted
+    private Vector3 leftPlantedWorldPos;
+    private Vector3 rightPlantedWorldPos;
+
     // Sync variables using Server-authoritative writes
     private NetworkVariable<bool> netLeftLegLifted = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     private NetworkVariable<bool> netRightLegLifted = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     
-    // Inputs must be synced from Player 1 Client to Server via RPC
+    // Inputs synced from clients to Server via RPC
     private NetworkVariable<float> netMoveInput = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     private NetworkVariable<float> netTurnInput = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
@@ -38,26 +43,28 @@ public class SharedBodyController : NetworkBehaviour
     {
         base.OnNetworkSpawn();
         
-        leftDefaultY = leftFootTarget.localPosition.y; // Local coordinates are safer if body moves
+        leftDefaultY = leftFootTarget.localPosition.y; 
         rightDefaultY = rightFootTarget.localPosition.y;
+
+        // Initialize baseline positions
+        leftPlantedWorldPos = leftFootTarget.position;
+        rightPlantedWorldPos = rightFootTarget.position;
+
+        InitializeLocalPlayerRole();
     }
 
     public void InitializeLocalPlayerRole()
     {
         ulong localClientId = NetworkManager.Singleton.LocalClientId;
-        
-        // Simple logic: Server/Host or first client is Player 1, second client is Player 2
         var connectedClients = NetworkManager.Singleton.ConnectedClientsIds;
         
         if (connectedClients.Count >= 1 && connectedClients[0] == localClientId)
         {
             localRole = PlayerRole.Player1_Waist;
-            Debug.Log("You are Player 1: Waist and Rotation Control.");
         }
         else if (connectedClients.Count >= 2 && connectedClients[1] == localClientId)
         {
             localRole = PlayerRole.Player2_Legs;
-            Debug.Log("You are Player 2: Leg Lifter.");
         }
     }
 
@@ -65,16 +72,13 @@ public class SharedBodyController : NetworkBehaviour
     {
         if (!IsSpawned) return;
 
-        // 1. Gather local inputs based on assigned role and send them to server
         HandleLocalInputs();
 
-        // 2. Only Server processes physical body movement using synced data
         if (IsServer)
         {
             ProcessServerMovement();
         }
 
-        // 3. EVERYONE updates visual components (Leg lifting) based on NetworkVariables
         ProcessFootHeights();
     }
 
@@ -82,23 +86,31 @@ public class SharedBodyController : NetworkBehaviour
     {
         if (Keyboard.current == null) return;
 
-        // PLAYER 1 INPUTS (Waist)
+        if (localRole == PlayerRole.Unassigned)
+        {
+            if (IsServer) localRole = PlayerRole.Player1_Waist;
+            else localRole = PlayerRole.Player2_Legs;
+        }
+
+        // PLAYER 1: Waist Controls (A/D to Pivot)
         if (localRole == PlayerRole.Player1_Waist)
         {
             float turn = 0f;
             if (Keyboard.current.dKey.isPressed || Keyboard.current.rightArrowKey.isPressed) turn += 1f;
             if (Keyboard.current.aKey.isPressed || Keyboard.current.leftArrowKey.isPressed) turn -= 1f;
 
+            SubmitWaistRotationServerRpc(turn);
+        }
+
+        // PLAYER 2: Leg Controls (W/S to Move, Q/E to Lift)
+        if (localRole == PlayerRole.Player2_Legs)
+        {
             float move = 0f;
             if (Keyboard.current.wKey.isPressed || Keyboard.current.upArrowKey.isPressed) move += 1f;
             if (Keyboard.current.sKey.isPressed || Keyboard.current.downArrowKey.isPressed) move -= 1f;
 
-            SubmitWaistInputServerRpc(move, turn);
-        }
+            SubmitLegMovementServerRpc(move);
 
-        // PLAYER 2 INPUTS (Legs)
-        if (localRole == PlayerRole.Player2_Legs)
-        {
             if (Keyboard.current.qKey.wasPressedThisFrame) SubmitLegStateServerRpc(true, true);
             if (Keyboard.current.qKey.wasReleasedThisFrame) SubmitLegStateServerRpc(true, false);
 
@@ -107,29 +119,46 @@ public class SharedBodyController : NetworkBehaviour
         }
     }
 
-    #region SERVER PHYSICS AND MOVEMENT Processing
+    #region SERVER PHYSICS AND MOVEMENT
     private void ProcessServerMovement()
     {
-        // Apply rotation from synced network input
+        // 1. Player 1 turns the core body object
         if (Mathf.Abs(netTurnInput.Value) > 0.01f)
         {
             transform.Rotate(Vector3.up, netTurnInput.Value * rotationSpeed * Time.deltaTime);
         }
 
-        // Apply forward/back movement from synced network input
+        // 2. Player 2 translates the entire core body object forward/backward
         if (Mathf.Abs(netMoveInput.Value) > 0.01f)
         {
-            transform.position += transform.forward * netMoveInput.Value * moveSpeed * Time.deltaTime;
+            Vector3 moveDirection = transform.forward * netMoveInput.Value * moveSpeed * Time.deltaTime;
+            transform.position += moveDirection;
+
+            // If a leg is LIFTED, its world position target rides forward through space perfectly with the body
+            if (netLeftLegLifted.Value)
+            {
+                leftPlantedWorldPos += moveDirection;
+            }
+            if (netRightLegLifted.Value)
+            {
+                rightPlantedWorldPos += moveDirection;
+            }
+            // Grounded feet get NO modification, making them drop backwards relative to the hips!
         }
     }
     #endregion
 
-    #region RPCS (INPUT SUBMISSIONS TO SERVER)
+    #region RPCS
     [Rpc(SendTo.Server)]
-    private void SubmitWaistInputServerRpc(float move, float turn)
+    private void SubmitWaistRotationServerRpc(float turn)
+    {
+        netTurnInput.Value = turn;
+    }
+
+    [Rpc(SendTo.Server)]
+    private void SubmitLegMovementServerRpc(float move)
     {
         netMoveInput.Value = move;
-        netTurnInput.Value = turn;
     }
 
     [Rpc(SendTo.Server)]
@@ -137,38 +166,51 @@ public class SharedBodyController : NetworkBehaviour
     {
         if (isLeftLeg) netLeftLegLifted.Value = isLifted;
         else netRightLegLifted.Value = isLifted;
+
+        // Snapping baseline when states toggle
+        if (IsServer)
+        {
+            if (isLeftLeg) leftPlantedWorldPos = leftFootTarget.position;
+            else rightPlantedWorldPos = rightFootTarget.position;
+        }
     }
     #endregion
 
-    #region VISUALS (EVERYONE)
+    #region VISUAL FOOT SNAP PROCESSING (EVERYONE)
     private void ProcessFootHeights()
     {
-        ProcessSingleFoot(leftFootTarget, netLeftLegLifted.Value, leftDefaultY);
-        ProcessSingleFoot(rightFootTarget, netRightLegLifted.Value, rightDefaultY);
+        ProcessSingleFoot(leftFootTarget, netLeftLegLifted.Value, leftDefaultY, ref leftPlantedWorldPos);
+        ProcessSingleFoot(rightFootTarget, netRightLegLifted.Value, rightDefaultY, ref rightPlantedWorldPos);
     }
 
-    private void ProcessSingleFoot(Transform footTarget, bool isLifted, float defaultY)
+    private void ProcessSingleFoot(Transform footTarget, bool isLifted, float defaultY, ref Vector3 plantedWorldPos)
     {
+        // Calculate where the floor layout surface is right under the foot's tracked coordinate position
+        Vector3 rayStart = new Vector3(plantedWorldPos.x, transform.position.y + 2f, plantedWorldPos.z);
+        float floorY = transform.position.y + defaultY; 
+
+        if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit, 5f, groundLayer))
+        {
+            floorY = hit.point.y;
+        }
+
         if (isLifted)
         {
-            float targetLiftHeight = transform.position.y + liftHeight;
-            footTarget.position = new Vector3(footTarget.position.x, targetLiftHeight, footTarget.position.z);
+            // Smoothly lift up over the floor height
+            float targetLiftHeight = floorY + liftHeight;
+            float newY = Mathf.MoveTowards(footTarget.position.y, targetLiftHeight, liftSpeed * Time.deltaTime);
+            
+            // Keep X and Z moving smoothly alongside the updated forward tracking reference position
+            footTarget.position = new Vector3(plantedWorldPos.x, newY, plantedWorldPos.z);
         }
         else
         {
-            Vector3 rayStart = new Vector3(footTarget.position.x, transform.position.y + 2f, footTarget.position.z);
-            float targetY = transform.position.y + defaultY; // Adjusted to be relative to the body's actual current height
-
-            if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit, 5f, groundLayer))
-            {
-                targetY = hit.point.y;
-            }
-
-            if (footTarget.position.y > targetY)
-            {
-                float newY = Mathf.MoveTowards(footTarget.position.y, targetY, dropSpeed * Time.deltaTime);
-                footTarget.position = new Vector3(footTarget.position.x, newY, footTarget.position.z);
-            }
+            // Lock foot directly down onto the targeted absolute anchor position coordinates
+            float newY = Mathf.MoveTowards(footTarget.position.y, floorY, dropSpeed * Time.deltaTime);
+            footTarget.position = new Vector3(plantedWorldPos.x, newY, plantedWorldPos.z);
+            
+            // Update reference tracking position
+            plantedWorldPos = footTarget.position;
         }
     }
     #endregion
