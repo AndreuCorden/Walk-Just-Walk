@@ -6,7 +6,7 @@ using UnityEngine.InputSystem;
 public class SharedBodyController : NetworkBehaviour
 {
     public enum PlayerRole { Unassigned, Player1_Waist, Player2_Legs }
-    
+
     [Header("Network Role")]
     public PlayerRole localRole = PlayerRole.Unassigned;
 
@@ -19,36 +19,44 @@ public class SharedBodyController : NetworkBehaviour
     [SerializeField] private Transform rightFootTarget;
 
     [Header("Manual Step Settings")]
-    [SerializeField] private float liftHeight = 0.3f; 
-    [SerializeField] private float liftSpeed = 8f;     
-    [SerializeField] private float dropSpeed = 10f;
+    [SerializeField] private float liftHeight = 0.4f;
+    [SerializeField] private float liftSpeed = 12f;
+    [SerializeField] private float dropSpeed = 15f;
     [SerializeField] private LayerMask groundLayer;
 
-    private float leftDefaultY;
-    private float rightDefaultY;
+    [Header("Rig Orientation Fix")]
+    [Tooltip("Adjust this if the feet spawn backwards or flipped. Try 180 if they point away.")]
+    [SerializeField] private float footForwardFlipCorrection = 180f;
 
-    // Track the exact world position where a foot was planted
+    // Persistent world anchors used when a foot is planted on the ground
     private Vector3 leftPlantedWorldPos;
+    private Quaternion leftPlantedWorldRot;
     private Vector3 rightPlantedWorldPos;
+    private Quaternion rightPlantedWorldRot;
 
-    // Sync variables using Server-authoritative writes
+    // Design-time local home points relative to the root body
+    private Vector3 leftFootHomeLocalPos;
+    private Vector3 rightFootHomeLocalPos;
+
+    // Synced states
     private NetworkVariable<bool> netLeftLegLifted = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     private NetworkVariable<bool> netRightLegLifted = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
-    
-    // Inputs synced from clients to Server via RPC
     private NetworkVariable<float> netMoveInput = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     private NetworkVariable<float> netTurnInput = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
     public override void OnNetworkSpawn()
     {
         base.OnNetworkSpawn();
-        
-        leftDefaultY = leftFootTarget.localPosition.y; 
-        rightDefaultY = rightFootTarget.localPosition.y;
 
-        // Initialize baseline positions
+        // Establish the baseline relative home positions
+        leftFootHomeLocalPos = transform.InverseTransformPoint(leftFootTarget.position);
+        rightFootHomeLocalPos = transform.InverseTransformPoint(rightFootTarget.position);
+
+        // Initialize world tracking arrays
         leftPlantedWorldPos = leftFootTarget.position;
+        leftPlantedWorldRot = leftFootTarget.rotation;
         rightPlantedWorldPos = rightFootTarget.position;
+        rightPlantedWorldRot = rightFootTarget.rotation;
 
         InitializeLocalPlayerRole();
     }
@@ -57,7 +65,7 @@ public class SharedBodyController : NetworkBehaviour
     {
         ulong localClientId = NetworkManager.Singleton.LocalClientId;
         var connectedClients = NetworkManager.Singleton.ConnectedClientsIds;
-        
+
         if (connectedClients.Count >= 1 && connectedClients[0] == localClientId)
         {
             localRole = PlayerRole.Player1_Waist;
@@ -78,8 +86,12 @@ public class SharedBodyController : NetworkBehaviour
         {
             ProcessServerMovement();
         }
+    }
 
-        ProcessFootHeights();
+    private void LateUpdate()
+    {
+        if (!IsSpawned) return;
+        ProcessProceduralLegBends();
     }
 
     private void HandleLocalInputs()
@@ -92,7 +104,7 @@ public class SharedBodyController : NetworkBehaviour
             else localRole = PlayerRole.Player2_Legs;
         }
 
-        // PLAYER 1: Waist Controls (A/D to Pivot)
+        // PLAYER 1: A/D Turning
         if (localRole == PlayerRole.Player1_Waist)
         {
             float turn = 0f;
@@ -102,7 +114,7 @@ public class SharedBodyController : NetworkBehaviour
             SubmitWaistRotationServerRpc(turn);
         }
 
-        // PLAYER 2: Leg Controls (W/S to Move, Q/E to Lift)
+        // PLAYER 2: W/S Stepping & Q/E Lifting
         if (localRole == PlayerRole.Player2_Legs)
         {
             float move = 0f;
@@ -119,31 +131,36 @@ public class SharedBodyController : NetworkBehaviour
         }
     }
 
-    #region SERVER PHYSICS AND MOVEMENT
+    #region SERVER PHYSICS
     private void ProcessServerMovement()
     {
-        // 1. Player 1 turns the core body object
+        // 1. Handle Turning (A/D)
         if (Mathf.Abs(netTurnInput.Value) > 0.01f)
         {
-            transform.Rotate(Vector3.up, netTurnInput.Value * rotationSpeed * Time.deltaTime);
+            float rotationAmount = netTurnInput.Value * rotationSpeed * Time.deltaTime;
+            Vector3 pivotPoint = transform.position;
+
+            transform.Rotate(Vector3.up, rotationAmount);
+
+            // ROTATION FIX: Rotate the world anchor targets around the body center pivot on the server
+            // so planted feet orbit with the body instead of tearing loose or snapping strangely
+            if (!netLeftLegLifted.Value)
+            {
+                leftPlantedWorldPos = Quaternion.Euler(0f, rotationAmount, 0f) * (leftPlantedWorldPos - pivotPoint) + pivotPoint;
+                leftPlantedWorldRot = Quaternion.Euler(0f, rotationAmount, 0f) * leftPlantedWorldRot;
+            }
+            if (!netRightLegLifted.Value)
+            {
+                rightPlantedWorldPos = Quaternion.Euler(0f, rotationAmount, 0f) * (rightPlantedWorldPos - pivotPoint) + pivotPoint;
+                rightPlantedWorldRot = Quaternion.Euler(0f, rotationAmount, 0f) * rightPlantedWorldRot;
+            }
         }
 
-        // 2. Player 2 translates the entire core body object forward/backward
+        // 2. Handle Forward/Backward Travel (W/S)
         if (Mathf.Abs(netMoveInput.Value) > 0.01f)
         {
             Vector3 moveDirection = transform.forward * netMoveInput.Value * moveSpeed * Time.deltaTime;
             transform.position += moveDirection;
-
-            // If a leg is LIFTED, its world position target rides forward through space perfectly with the body
-            if (netLeftLegLifted.Value)
-            {
-                leftPlantedWorldPos += moveDirection;
-            }
-            if (netRightLegLifted.Value)
-            {
-                rightPlantedWorldPos += moveDirection;
-            }
-            // Grounded feet get NO modification, making them drop backwards relative to the hips!
         }
     }
     #endregion
@@ -166,52 +183,64 @@ public class SharedBodyController : NetworkBehaviour
     {
         if (isLeftLeg) netLeftLegLifted.Value = isLifted;
         else netRightLegLifted.Value = isLifted;
-
-        // Snapping baseline when states toggle
-        if (IsServer)
-        {
-            if (isLeftLeg) leftPlantedWorldPos = leftFootTarget.position;
-            else rightPlantedWorldPos = rightFootTarget.position;
-        }
     }
     #endregion
 
-    #region VISUAL FOOT SNAP PROCESSING (EVERYONE)
-    private void ProcessFootHeights()
+    #region VISUAL PROCEDURAL KINEMATICS
+    private void ProcessProceduralLegBends()
     {
-        ProcessSingleFoot(leftFootTarget, netLeftLegLifted.Value, leftDefaultY, ref leftPlantedWorldPos);
-        ProcessSingleFoot(rightFootTarget, netRightLegLifted.Value, rightDefaultY, ref rightPlantedWorldPos);
+        ResolveSingleLegKinematics(leftFootTarget, netLeftLegLifted.Value, leftFootHomeLocalPos, ref leftPlantedWorldPos, ref leftPlantedWorldRot);
+        ResolveSingleLegKinematics(rightFootTarget, netRightLegLifted.Value, rightFootHomeLocalPos, ref rightPlantedWorldPos, ref rightPlantedWorldRot);
     }
 
-    private void ProcessSingleFoot(Transform footTarget, bool isLifted, float defaultY, ref Vector3 plantedWorldPos)
+    private void ResolveSingleLegKinematics(Transform footTarget, bool isLifted, Vector3 homeLocalPos, ref Vector3 plantedWorldPos, ref Quaternion plantedWorldRot)
     {
-        // Calculate where the floor layout surface is right under the foot's tracked coordinate position
-        Vector3 rayStart = new Vector3(plantedWorldPos.x, transform.position.y + 2f, plantedWorldPos.z);
-        float floorY = transform.position.y + defaultY; 
-
-        if (Physics.Raycast(rayStart, Vector3.down, out RaycastHit hit, 5f, groundLayer))
-        {
-            floorY = hit.point.y;
-        }
-
+        // 1. HORIZONTAL TRACKING (X and Z Coordinates)
         if (isLifted)
         {
-            // Smoothly lift up over the floor height
-            float targetLiftHeight = floorY + liftHeight;
-            float newY = Mathf.MoveTowards(footTarget.position.y, targetLiftHeight, liftSpeed * Time.deltaTime);
+            // If actively lifted by Player 2, pull it forward smoothly toward its home tracking slot
+            Vector3 worldHomePos = transform.TransformPoint(homeLocalPos);
             
-            // Keep X and Z moving smoothly alongside the updated forward tracking reference position
-            footTarget.position = new Vector3(plantedWorldPos.x, newY, plantedWorldPos.z);
+            // Step position updates over time
+            Vector3 currentXZ = Vector3.MoveTowards(
+                new Vector3(footTarget.position.x, 0f, footTarget.position.z),
+                new Vector3(worldHomePos.x, 0f, worldHomePos.z),
+                liftSpeed * Time.deltaTime
+            );
+
+            // Reorient smoothly toward the movement vector plus our required rig fix factor
+            Quaternion targetRotation = transform.rotation * Quaternion.Euler(0f, footForwardFlipCorrection, 0f);
+            footTarget.rotation = Quaternion.Slerp(footTarget.rotation, targetRotation, liftSpeed * Time.deltaTime);
+
+            // Keep updating our target anchor coordinates while in flight
+            plantedWorldPos = new Vector3(currentXZ.x, footTarget.position.y, currentXZ.z);
+            plantedWorldRot = footTarget.rotation;
         }
         else
         {
-            // Lock foot directly down onto the targeted absolute anchor position coordinates
-            float newY = Mathf.MoveTowards(footTarget.position.y, floorY, dropSpeed * Time.deltaTime);
-            footTarget.position = new Vector3(plantedWorldPos.x, newY, plantedWorldPos.z);
-            
-            // Update reference tracking position
-            plantedWorldPos = footTarget.position;
+            // If planted, keep it strictly locked to its world target coordinates.
+            // When turning, the server recalculates this position vector so it smoothly orbits.
+            footTarget.rotation = plantedWorldRot;
         }
+
+        // 2. VERTICAL HEIGHT SYSTEM (Y Axis Tracking - ALWAYS runs smoothly)
+        Vector3 groundRayStart = new Vector3(plantedWorldPos.x, transform.position.y + 2f, plantedWorldPos.z);
+        float targetFloorY = transform.position.y + homeLocalPos.y; // Fallback height profile
+
+        if (Physics.Raycast(groundRayStart, Vector3.down, out RaycastHit hit, 5f, groundLayer))
+        {
+            targetFloorY = hit.point.y;
+        }
+
+        // Calculate the ideal height coordinate depending on whether the leg is lifted
+        float finalTargetHeight = targetFloorY + (isLifted ? liftHeight : 0f);
+        
+        // Choose the speed based on whether the leg is traveling up or coming down
+        float interpolationSpeed = isLifted ? liftSpeed : dropSpeed;
+        float finalY = Mathf.MoveTowards(footTarget.position.y, finalTargetHeight, interpolationSpeed * Time.deltaTime);
+
+        // Combine the decoupled horizontal target position with the calculated vertical ground height position
+        footTarget.position = new Vector3(plantedWorldPos.x, finalY, plantedWorldPos.z);
     }
     #endregion
 }
