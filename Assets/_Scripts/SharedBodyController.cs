@@ -2,6 +2,7 @@ using System.Collections;
 using UnityEngine;
 using Unity.Netcode;
 using UnityEngine.InputSystem;
+using UnityEngine.Animations.Rigging;
 
 public class SharedBodyController : NetworkBehaviour
 {
@@ -18,23 +19,43 @@ public class SharedBodyController : NetworkBehaviour
     [SerializeField] private Transform leftFootTarget;
     [SerializeField] private Transform rightFootTarget;
 
+    [Header("IK Arm Targets (Balance Warning)")]
+    [SerializeField] private Transform leftArmTarget;
+    [SerializeField] private Transform rightArmTarget;
+    [SerializeField] private RigBuilder rigBuilder;
+
     [Header("Manual Step Settings")]
     [SerializeField] private float liftHeight = 0.4f;
     [SerializeField] private float liftSpeed = 12f;
     [SerializeField] private float dropSpeed = 15f;
     [SerializeField] private LayerMask groundLayer;
 
-    // Persistent world anchors for the grounded state
+    [Header("Advanced Balance Mechanics")]
+    [Tooltip("Maximum horizontal distance the body can move away from the support foot before falling.")]
+    [SerializeField] private float maxBalanceDistance = 0.8f;
+    [Tooltip("Distance split from the foot where arms begin spreading and shaking.")]
+    [SerializeField] private float warningThreshold = 0.4f;
+    [Tooltip("How far outward the arms expand when completely off balance.")]
+    [SerializeField] private float armSpreadDistance = 0.7f;
+    [Tooltip("How violent the arm shaking is right before falling.")]
+    [SerializeField] private float shakeIntensity = 0.08f;
+
+    // Persistent world anchors for grounded feet
     private Vector3 leftPlantedWorldPos;
     private Quaternion leftPlantedWorldRot;
     private Vector3 rightPlantedWorldPos;
     private Quaternion rightPlantedWorldRot;
 
-    // Rig architectural defaults captured at runtime spawn
+    // Rig defaults captured at spawn time
     private Vector3 leftFootHomeLocalPos;
     private Quaternion leftFootHomeLocalRot;
     private Vector3 rightFootHomeLocalPos;
     private Quaternion rightFootHomeLocalRot;
+
+    private Vector3 leftArmHomeLocalPos;
+    private Vector3 rightArmHomeLocalPos;
+
+    private Rigidbody rb;
 
     // Synced Netcode states
     private NetworkVariable<bool> netLeftLegLifted = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
@@ -42,24 +63,44 @@ public class SharedBodyController : NetworkBehaviour
     private NetworkVariable<float> netMoveInput = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     private NetworkVariable<float> netTurnInput = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
+    // Synced balance variables
+    private NetworkVariable<bool> netIsFallen = new NetworkVariable<bool>(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<float> netBalanceWarningFactor = new NetworkVariable<float>(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private Vector3 serverFallDirection;
+
+    private void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+    }
+
     public override void OnNetworkSpawn()
     {
         base.OnNetworkSpawn();
 
-        // Capture EXACT offsets and structural rotations relative to the character root
+        // Capture default structural matrices
         leftFootHomeLocalPos = transform.InverseTransformPoint(leftFootTarget.position);
         leftFootHomeLocalRot = Quaternion.Inverse(transform.rotation) * leftFootTarget.rotation;
-
         rightFootHomeLocalPos = transform.InverseTransformPoint(rightFootTarget.position);
         rightFootHomeLocalRot = Quaternion.Inverse(transform.rotation) * rightFootTarget.rotation;
 
-        // Set up baseline world tracking vectors
+        if (leftArmTarget != null) leftArmHomeLocalPos = leftArmTarget.localPosition;
+        if (rightArmTarget != null) rightArmHomeLocalPos = rightArmTarget.localPosition;
+
         leftPlantedWorldPos = leftFootTarget.position;
         leftPlantedWorldRot = leftFootTarget.rotation;
         rightPlantedWorldPos = rightFootTarget.position;
         rightPlantedWorldRot = rightFootTarget.rotation;
 
         InitializeLocalPlayerRole();
+
+        // Listen for fall state changes to toggle physical configurations globally
+        netIsFallen.OnValueChanged += OnFallStateChanged;
+    }
+
+    public override void OnNetworkDespawn()
+    {
+        netIsFallen.OnValueChanged -= OnFallStateChanged;
+        base.OnNetworkDespawn();
     }
 
     public void InitializeLocalPlayerRole()
@@ -81,18 +122,23 @@ public class SharedBodyController : NetworkBehaviour
     {
         if (!IsSpawned) return;
 
+        if (netIsFallen.Value) return; // If fallen, physics engine handles entirely
+
         HandleLocalInputs();
 
         if (IsServer)
         {
             ProcessServerMovement();
+            CheckServerBalance();
         }
     }
 
     private void LateUpdate()
     {
-        if (!IsSpawned) return;
+        if (!IsSpawned || netIsFallen.Value) return;
+
         ProcessProceduralLegBends();
+        ProcessProceduralArmShaking();
     }
 
     private void HandleLocalInputs()
@@ -105,7 +151,6 @@ public class SharedBodyController : NetworkBehaviour
             else localRole = PlayerRole.Player2_Legs;
         }
 
-        // PLAYER 1: Waist Controls (A/D)
         if (localRole == PlayerRole.Player1_Waist)
         {
             float turn = 0f;
@@ -115,7 +160,6 @@ public class SharedBodyController : NetworkBehaviour
             SubmitWaistRotationServerRpc(turn);
         }
 
-        // PLAYER 2: Leg Controls (W/S and Q/E)
         if (localRole == PlayerRole.Player2_Legs)
         {
             float move = 0f;
@@ -132,10 +176,9 @@ public class SharedBodyController : NetworkBehaviour
         }
     }
 
-    #region SERVER PHYSICS
+    #region SERVER PHYSICS & BALANCE CONTROLLER
     private void ProcessServerMovement()
     {
-        // 1. Handle Turning (A/D) - Always allowed so players can look around while stationary
         if (Mathf.Abs(netTurnInput.Value) > 0.01f)
         {
             float rotationAmount = netTurnInput.Value * rotationSpeed * Time.deltaTime;
@@ -143,7 +186,6 @@ public class SharedBodyController : NetworkBehaviour
 
             transform.Rotate(Vector3.up, rotationAmount);
 
-            // Rotate world anchors smoothly around the player's pivot point
             if (!netLeftLegLifted.Value)
             {
                 leftPlantedWorldPos = Quaternion.Euler(0f, rotationAmount, 0f) * (leftPlantedWorldPos - pivotPoint) + pivotPoint;
@@ -156,43 +198,121 @@ public class SharedBodyController : NetworkBehaviour
             }
         }
 
-        // 2. FINAL CONDITION FIX: Handle Forward/Backward Travel (W/S)
-        // ONLY translate position if Player 2 is actively lifting at least one leg (Q or E)
         if (Mathf.Abs(netMoveInput.Value) > 0.01f)
         {
-            bool isAnyLegLifted = netLeftLegLifted.Value || netRightLegLifted.Value;
-
-            if (isAnyLegLifted)
+            if (netLeftLegLifted.Value || netRightLegLifted.Value)
             {
                 Vector3 moveDirection = transform.forward * netMoveInput.Value * moveSpeed * Time.deltaTime;
                 transform.position += moveDirection;
             }
         }
     }
+
+    private void CheckServerBalance()
+    {
+        // Balanced if feet are in matching states
+        if (netLeftLegLifted.Value == netRightLegLifted.Value)
+        {
+            netBalanceWarningFactor.Value = Mathf.MoveTowards(netBalanceWarningFactor.Value, 0f, Time.deltaTime * 2f);
+            return;
+        }
+
+        Vector3 supportFootPos = netLeftLegLifted.Value ? rightPlantedWorldPos : leftPlantedWorldPos;
+        Vector3 flatBodyCenter = new Vector3(transform.position.x, 0f, transform.position.z);
+        Vector3 flatSupportFoot = new Vector3(supportFootPos.x, 0f, supportFootPos.z);
+
+        float horizontalDisplacement = Vector3.Distance(flatBodyCenter, flatSupportFoot);
+
+        // 1. Calculate Warning Factor (0 to 1) based on current lean limits
+        if (horizontalDisplacement > warningThreshold)
+        {
+            float range = maxBalanceDistance - warningThreshold;
+            netBalanceWarningFactor.Value = Mathf.Clamp01((horizontalDisplacement - warningThreshold) / range);
+        }
+        else
+        {
+            netBalanceWarningFactor.Value = Mathf.MoveTowards(netBalanceWarningFactor.Value, 0f, Time.deltaTime * 2f);
+        }
+
+        // 2. CRITICAL TIP-OVER CHECK
+        if (horizontalDisplacement > maxBalanceDistance)
+        {
+            serverFallDirection = transform.forward * (netMoveInput.Value >= 0f ? 1f : -1f);
+            if (serverFallDirection == Vector3.zero) serverFallDirection = transform.forward;
+
+            netIsFallen.Value = true;
+        }
+    }
+    #endregion
+
+    #region PHYSICAL FALL HANDLING
+    private void OnFallStateChanged(bool oldState, bool newState)
+    {
+        if (newState == true)
+        {
+            // Turn off the animation rig so bones collapse freely under physics
+            if (rigBuilder != null) rigBuilder.enabled = false;
+
+            // Find EVERY child bone collider/rigidbody created by the ragdoll wizard and wake them up!
+            Rigidbody[] childRbs = GetComponentsInChildren<Rigidbody>(true);
+            foreach (Rigidbody boneRb in childRbs)
+            {
+                boneRb.isKinematic = false;
+                boneRb.useGravity = true;
+
+                // Add an organic push to the bones to make the fall look violent
+                if (IsServer)
+                {
+                    boneRb.AddForce(serverFallDirection * 5f, ForceMode.Impulse);
+                }
+            }
+        }
+    }    
+    #endregion
+
+    #region PROCEDURAL ARM SHAKING VISUALS
+    private void ProcessProceduralArmShaking()
+    {
+        if (leftArmTarget == null || rightArmTarget == null) return;
+
+        float warningFactor = netBalanceWarningFactor.Value;
+
+        if (warningFactor > 0.01f)
+        {
+            int armShakeSpeed = 1;
+            // Calculate a high-frequency noise shake using Sine waves and time variables
+            float shakeOffset = Mathf.Sin(Time.time * armShakeSpeed) * shakeIntensity * warningFactor;
+
+            // Displace targets horizontally outward (Left goes negative X, Right goes positive X)
+            Vector3 leftTargetPos = leftArmHomeLocalPos + new Vector3(-armSpreadDistance * warningFactor, armSpreadDistance * 0.5f * warningFactor, 0f);
+            Vector3 rightTargetPos = rightArmHomeLocalPos + new Vector3(armSpreadDistance * warningFactor, armSpreadDistance * 0.5f * warningFactor, 0f);
+
+            // Add shake jitter directly onto the targets
+            leftArmTarget.localPosition = leftTargetPos + new Vector3(0f, shakeOffset, Random.Range(-shakeOffset, shakeOffset) * 0.5f);
+            rightArmTarget.localPosition = rightTargetPos + new Vector3(0f, -shakeOffset, Random.Range(-shakeOffset, shakeOffset) * 0.5f);
+        }
+        else
+        {
+            // Return smoothly to normal resting posture when safely balanced
+            leftArmTarget.localPosition = Vector3.MoveTowards(leftArmTarget.localPosition, leftArmHomeLocalPos, Time.deltaTime * 4f);
+            rightArmTarget.localPosition = Vector3.MoveTowards(rightArmTarget.localPosition, rightArmHomeLocalPos, Time.deltaTime * 4f);
+        }
+    }
     #endregion
 
     #region RPCS
-    [Rpc(SendTo.Server)]
-    private void SubmitWaistRotationServerRpc(float turn)
-    {
-        netTurnInput.Value = turn;
-    }
-
-    [Rpc(SendTo.Server)]
-    private void SubmitLegMovementServerRpc(float move)
-    {
-        netMoveInput.Value = move;
-    }
-
+    [Rpc(SendTo.Server)] private void SubmitWaistRotationServerRpc(float turn) { if (!netIsFallen.Value) netTurnInput.Value = turn; }
+    [Rpc(SendTo.Server)] private void SubmitLegMovementServerRpc(float move) { if (!netIsFallen.Value) netMoveInput.Value = move; }
     [Rpc(SendTo.Server)]
     private void SubmitLegStateServerRpc(bool isLeftLeg, bool isLifted)
     {
+        if (netIsFallen.Value) return;
         if (isLeftLeg) netLeftLegLifted.Value = isLifted;
         else netRightLegLifted.Value = isLifted;
     }
     #endregion
 
-    #region VISUAL PROCEDURAL KINEMATICS
+    #region PROCEDURAL LEG KINEMATICS
     private void ProcessProceduralLegBends()
     {
         ResolveSingleLegKinematics(leftFootTarget, netLeftLegLifted.Value, leftFootHomeLocalPos, leftFootHomeLocalRot, ref leftPlantedWorldPos, ref leftPlantedWorldRot);
@@ -212,7 +332,6 @@ public class SharedBodyController : NetworkBehaviour
             targetFloorY = hit.point.y;
         }
 
-        // 1. HORIZONTAL & ROTATIONAL TRACKING
         if (isLifted)
         {
             Vector3 currentXZ = Vector3.MoveTowards(
@@ -231,7 +350,6 @@ public class SharedBodyController : NetworkBehaviour
             footTarget.rotation = plantedWorldRot;
         }
 
-        // 2. VERTICAL HEIGHT SYSTEM
         float finalTargetHeight = targetFloorY + (isLifted ? liftHeight : 0f);
         float interpolationSpeed = isLifted ? liftSpeed : dropSpeed;
         float finalY = Mathf.MoveTowards(footTarget.position.y, finalTargetHeight, interpolationSpeed * Time.deltaTime);
